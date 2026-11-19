@@ -1197,6 +1197,55 @@ command_log() {
   fi
 }
 
+command_publish_stacked() {
+  [ "$#" -eq 0 ] || die "bruk: git patch publish-stacked"
+  local id source branch base_ref existing_stack
+  local -a branches=()
+
+  stack_context
+  load_stack
+  [ -n "$STACK_PATCHES" ] ||
+    die "ingen aktive patcher å publisere"
+
+  has_worktree_changes &&
+    die "arbeidstreet har ucommittede endringer; commit eller stash dem før publisering"
+
+  for id in $(stack_patch_ids); do
+    source=$(git config --local --get "$(patch_meta_key "$id" source)" ||
+      patch_name_for_id "$id") ||
+      die "stack-metadata mangler source-branch for patchen '$id'"
+    git show-ref --verify --quiet "refs/heads/$source" ||
+      die "fant ikke den lokale source-branchen '$source'"
+    branches[${#branches[@]}]=$source
+  done
+  branches[${#branches[@]}]=$CURRENT_BRANCH
+
+  base_ref=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD) ||
+    die "fant ikke origin/HEAD; konfigurer standardbranchen for origin"
+  branch=${base_ref#origin/}
+
+  command -v gh >/dev/null 2>&1 ||
+    die "GitHub CLI (gh) er nødvendig for å publisere en stack"
+  gh stack --help >/dev/null 2>&1 ||
+    die "gh-stack-utvidelsen mangler; installer den før publisering"
+  gh auth status >/dev/null 2>&1 ||
+    die "gh er ikke autentisert; kjør 'gh auth login'"
+  gh repo view --json nameWithOwner >/dev/null 2>&1 ||
+    die "fant ingen GitHub-repositorykonfigurasjon for dette repoet"
+
+  existing_stack=$(gh stack view --json 2>/dev/null || true)
+  if [ -n "$existing_stack" ]; then
+    gh stack unstack --local ||
+      die "kunne ikke oppdatere eksisterende lokal gh-stack-konfigurasjon"
+  fi
+  gh stack init --base "$branch" "${branches[@]}" ||
+    die "gh stack init feilet; ingen lokal stackhistorikk ble omskrevet av git-patch"
+  gh stack submit --auto ||
+    die "gh stack submit feilet"
+
+  printf 'Publiserte patch-stacken med gh stack.\n'
+}
+
 case ${1-} in
   -h|--help|help)
     usage
@@ -1228,8 +1277,8 @@ case ${1-} in
     command_drop "$@"
     ;;
   publish-stacked)
-    printf '%s: %s is not implemented yet\n' "$program" "$1" >&2
-    exit 125
+    shift
+    command_publish_stacked "$@"
     ;;
   "")
     usage >&2
