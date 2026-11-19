@@ -18,4 +18,6 @@ output=$(git patch add cache 2>&1)
 assert_contains "$output" "origin/cache er nyere enn lokal cache"
 assert_contains "$output" "Lokal cache ble lagt til"
 git grep -q 'local cache' HEAD
-git grep -q 'remote cache' HEAD && fail "remote cache was applied"
+if git grep -q 'remote cache' HEAD; then
+  fail "remote cache was applied"
+fi

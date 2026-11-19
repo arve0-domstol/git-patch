@@ -13,4 +13,6 @@ output=$(git patch check-conflicts cache 2>&1 || true)
 assert_contains "$output" "app.txt"
 assert_contains "$output" "conflict"
 assert_equals "$before" "$(git rev-parse HEAD)"
-git status --porcelain | grep -q . && fail "check-conflicts changed the worktree"
+if git status --porcelain | grep -q .; then
+  fail "check-conflicts changed the worktree"
+fi
