@@ -34,7 +34,9 @@ git push -q origin main
 git switch -q feature
 git patch sync
 
-if git patch list | grep -q cache; then
+list_output=$(git patch list) ||
+  fail "git patch list failed after delivered cache was removed"
+if printf '%s\n' "$list_output" | grep -q cache; then
   fail "delivered cache remained in list output"
 fi
 if git config --local --get \
