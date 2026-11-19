@@ -9,7 +9,7 @@ create_feature_branch "$fixture"
 git patch add cache
 
 git switch -q main
-git cherry-pick -q "$cache_commit"
+git cherry-pick "$cache_commit" >/dev/null
 git push -q origin main
 git switch -q feature
 git patch sync
