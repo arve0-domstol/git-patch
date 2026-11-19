@@ -737,6 +737,125 @@ command_sync() {
   esac
 }
 
+list_patch_delivery() {
+  local active_base=$1 active_tip=$2 main_tip
+
+  main_tip=$(git rev-parse --verify "origin/HEAD^{commit}" 2>/dev/null || true)
+  if [ -z "$main_tip" ]; then
+    LIST_DELIVERY=unknown
+    return
+  fi
+  if patch_is_delivered "$active_base" "$active_tip" "$main_tip"; then
+    LIST_DELIVERY=delivered
+  elif patch_may_be_delivered "$active_base" "$active_tip" "$main_tip"; then
+    LIST_DELIVERY="possibly delivered"
+  else
+    LIST_DELIVERY="not detected"
+  fi
+}
+
+list_patch_conflicts() {
+  local requested_id=$1 requested_base=$2 requested_tip=$3
+  local id base snapshot parent tree index error_file patch_parent commit first_parent
+  local feature_commits
+
+  index="$GIT_DIR/git-patch-list-index.$$"
+  error_file="$GIT_DIR/git-patch-list-error.$$"
+  rm -f "$index" "$error_file"
+  CONFLICT_FILES=
+  parent=$STACK_BASE
+  for id in $(stack_patch_ids); do
+    if [ "$id" = "$requested_id" ]; then
+      base=$requested_base
+      snapshot=$requested_tip
+    else
+      base=$(base_tip_for_id "$id")
+      snapshot=$(source_tip_for_id "$id")
+    fi
+    if ! apply_tree_diff "$base" "$snapshot" "$parent" "$index" "$error_file" \
+      >/dev/null 2>&1; then
+      LIST_CONFLICTS=${CONFLICT_FILES:-detected}
+      rm -f "$index" "$error_file"
+      return
+    fi
+    parent=$APPLIED_TREE
+  done
+
+  patch_parent=$STACK_FEATURE_START
+  feature_commits=$(git rev-list --reverse "$patch_parent..HEAD" --first-parent)
+  for commit in $feature_commits; do
+    first_parent=$(git rev-parse "$commit^1") || {
+      LIST_CONFLICTS=unknown
+      rm -f "$index" "$error_file"
+      return
+    }
+    if ! apply_tree_diff "$first_parent" "$commit" "$parent" \
+      "$index" "$error_file" >/dev/null 2>&1; then
+      LIST_CONFLICTS=${CONFLICT_FILES:-detected}
+      rm -f "$index" "$error_file"
+      return
+    fi
+    parent=$APPLIED_TREE
+  done
+  LIST_CONFLICTS=none
+  rm -f "$index" "$error_file"
+}
+
+command_list() {
+  [ "$#" -eq 0 ] || die "bruk: git patch list"
+  local id patch source current_tip active_tip active_base source_base
+  local source_state order=0
+
+  stack_setup
+  load_stack
+  if [ -z "$STACK_PATCHES" ]; then
+    printf '0 active patches\n'
+    return
+  fi
+
+  for id in $(stack_patch_ids); do
+    order=$((order + 1))
+    patch=$(patch_name_for_id "$id")
+    source=$(git config --local --get "$(patch_meta_key "$id" source)" ||
+      printf '%s' "$patch")
+    active_base=$(base_tip_for_id "$id")
+    active_tip=$(source_tip_for_id "$id")
+    current_tip=$(git rev-parse --verify "refs/heads/$source^{commit}" 2>/dev/null ||
+      true)
+
+    source_state=current
+    if [ -z "$current_tip" ]; then
+      source_state=missing
+    elif [ "$current_tip" != "$active_tip" ]; then
+      source_state=outdated
+    fi
+
+    list_patch_delivery "$active_base" "$active_tip"
+    if [ -z "$current_tip" ]; then
+      LIST_CONFLICTS=unknown
+    else
+      if [ "$current_tip" = "$active_tip" ]; then
+        source_base=$active_base
+      else
+        source_base=$(git merge-base "$current_tip" origin/HEAD 2>/dev/null || true)
+      fi
+      if [ -z "$source_base" ]; then
+        LIST_CONFLICTS=unknown
+      elif [ -n "$(git rev-list --merges "$source_base..$current_tip")" ]; then
+        LIST_CONFLICTS="unknown (source contains a merge commit)"
+      else
+        list_patch_conflicts "$id" "$source_base" "$current_tip"
+      fi
+    fi
+
+    printf '%s. %s\n' "$order" "$patch"
+    printf '   source: %s (%s)\n' "$source" "$source_state"
+    printf '   delivery: %s\n' "$LIST_DELIVERY"
+    printf '   conflicts: %s\n' "$(printf '%s' "$LIST_CONFLICTS" |
+      tr '\n' ',' | sed 's/,$//; s/,/, /g')"
+  done
+}
+
 command_log() {
   stack_setup
   git config --local --get-all "$STACK_PREFIX.operations.value" 2>/dev/null ||
@@ -765,7 +884,11 @@ case ${1-} in
     [ "$#" -eq 0 ] || die "bruk: git patch log"
     command_log
     ;;
-  list|drop|publish-stacked)
+  list)
+    shift
+    command_list "$@"
+    ;;
+  drop|publish-stacked)
     printf '%s: %s is not implemented yet\n' "$program" "$1" >&2
     exit 125
     ;;
