@@ -22,12 +22,346 @@ Run 'git patch --help' to show this help.
 EOF
 }
 
+die() {
+  printf '%s: %s\n' "$program" "$*" >&2
+  exit 1
+}
+
+git_config_key() {
+  printf 'git-patch.%s.%s' "$STACK_ID" "$1"
+}
+
+patch_id() {
+  printf '%s' "$1" | git hash-object --stdin
+}
+
+stack_setup() {
+  CURRENT_BRANCH=$(git symbolic-ref -q --short HEAD) ||
+    die "du må stå på en lokal branch"
+  STACK_ID=$(printf '%s' "$CURRENT_BRANCH" | git hash-object --stdin)
+  STACK_PREFIX="git-patch.$STACK_ID"
+  GIT_DIR=$(git rev-parse --git-dir) || die "ikke i et Git-repo"
+  STACK_REF="refs/git-patch/stacks/$STACK_ID"
+
+  STACK_BASE=$(git config --local --get "$(git_config_key base)" || true)
+  if [ -n "$STACK_BASE" ]; then
+    STACK_FEATURE_START=$(git rev-parse "$STACK_REF/feature-start") ||
+      die "stack-metadata er ufullstendig"
+    return
+  fi
+
+  git rev-parse --verify origin/HEAD^{commit} >/dev/null 2>&1 ||
+    die "fant ikke origin/HEAD"
+  STACK_BASE=$(git merge-base HEAD origin/HEAD) ||
+    die "fant ikke felles base med origin/HEAD"
+  STACK_FEATURE_START=$STACK_BASE
+}
+
+load_stack() {
+  STACK_PATCHES=
+  if [ -n "$(git config --local --get-regexp "^$STACK_PREFIX\\.patches\\." 2>/dev/null || true)" ]; then
+    STACK_PATCHES=$(git config --local --get-regexp "^$STACK_PREFIX\\.patches\\." |
+      sed 's/^[^ ]* *//' | sed '/^$/d')
+  fi
+}
+
+patch_meta_key() {
+  printf '%s.patch.%s.%s' "$STACK_PREFIX" "$1" "$2"
+}
+
+patch_name_for_id() {
+  git config --local --get "$(patch_meta_key "$1" name)"
+}
+
+source_tip_for_id() {
+  git rev-parse "$STACK_REF/patch/$1/source"
+}
+
+base_tip_for_id() {
+  git rev-parse "$STACK_REF/patch/$1/base"
+}
+
+stack_patch_ids() {
+  printf '%s\n' "$STACK_PATCHES" | sed '/^$/d'
+}
+
+source_info() {
+  local patch=$1 source="refs/heads/$patch" remote="refs/remotes/origin/$patch"
+  local base source_tip
+
+  git rev-parse --verify "$source^{commit}" >/dev/null 2>&1 ||
+    die "fant ikke den lokale branchen '$patch'"
+  base=$(git merge-base "$source" origin/HEAD) ||
+    die "fant ikke merge-base for '$patch' og origin/HEAD"
+  git rev-list --merges "$base..$source" | grep -q . &&
+    die "patch-branchen '$patch' inneholder en merge-commit"
+
+  source_tip=$(git rev-parse "$source^{commit}")
+  if git rev-parse --verify "$remote^{commit}" >/dev/null 2>&1; then
+    remote_tip=$(git rev-parse "$remote^{commit}")
+    if [ "$remote_tip" != "$source_tip" ] &&
+      git merge-base --is-ancestor "$source_tip" "$remote_tip"; then
+      REMOTE_NEWER=1
+    fi
+  fi
+  SOURCE_BASE=$base
+  SOURCE_TIP=$source_tip
+}
+
+apply_tree_diff() {
+  local from=$1 to=$2 parent=$3 index=$4 error_file=$5
+
+  rm -f "$index"
+  GIT_INDEX_FILE=$index git read-tree "$parent" || return 1
+  if ! git diff --binary --full-index "$from" "$to" |
+    GIT_INDEX_FILE=$index git apply --cached --3way --whitespace=nowarn - \
+      >"$error_file" 2>&1; then
+    CONFLICT_FILES=$(GIT_INDEX_FILE=$index git ls-files -u |
+      awk '{sub(/^[^\t]*\t/, ""); print}' | sort -u)
+    [ -n "$CONFLICT_FILES" ] || CONFLICT_FILES=$(sed -n \
+      -e 's/^error: patch failed: *//p' \
+      -e 's/^CONFLICT (content): Merge conflict in *//p' "$error_file")
+    cat "$error_file" >&2
+    return 1
+  fi
+  APPLIED_TREE=$(GIT_INDEX_FILE=$index git write-tree)
+}
+
+rewrite_commit_tree() {
+  local old=$1 tree=$2 parent=$3
+  {
+    printf 'tree %s\n' "$tree"
+    printf 'parent %s\n' "$parent"
+    git cat-file commit "$old" | sed -n '/^author /,$p'
+  } | git hash-object -t commit -w --stdin
+}
+
+build_stack_tip() {
+  local requested_id=$1 requested_name=$2 requested_base=$3 requested_tip=$4
+  local id name base snapshot parent tree commit index error_file patch_parent
+  local feature_commits first_parent
+
+  index="$GIT_DIR/git-patch-index.$$"
+  error_file="$GIT_DIR/git-patch-error.$$"
+  rm -f "$index" "$error_file"
+  CONFLICT_FILES=
+  parent=$STACK_BASE
+  for id in $(stack_patch_ids); do
+    name=$(patch_name_for_id "$id")
+    if [ "$id" = "$requested_id" ]; then
+      base=$requested_base
+      snapshot=$requested_tip
+    else
+      base=$(base_tip_for_id "$id")
+      snapshot=$(source_tip_for_id "$id")
+    fi
+    apply_tree_diff "$base" "$snapshot" "$parent" "$index" "$error_file" || {
+      rm -f "$index" "$error_file"
+      return 1
+    }
+    tree=$APPLIED_TREE
+    commit=$(printf 'git-patch: %s\n' "$name" |
+      git commit-tree "$tree" -p "$parent")
+    parent=$commit
+  done
+
+  if ! stack_patch_ids | grep -q "^$requested_id$"; then
+    apply_tree_diff "$requested_base" "$requested_tip" "$parent" \
+      "$index" "$error_file" || {
+      rm -f "$index" "$error_file"
+      return 1
+    }
+    tree=$APPLIED_TREE
+    parent=$(printf 'git-patch: %s\n' "$requested_name" |
+      git commit-tree "$tree" -p "$parent")
+  fi
+  BUILT_PATCH_TIP=$parent
+
+  patch_parent=$STACK_FEATURE_START
+  feature_commits=$(git rev-list --reverse "$patch_parent..HEAD" --first-parent)
+  for commit in $feature_commits; do
+    first_parent=$(git rev-parse "$commit^1") || {
+      rm -f "$index" "$error_file"
+      return 1
+    }
+    apply_tree_diff "$first_parent" "$commit" "$parent" \
+      "$index" "$error_file" || {
+      rm -f "$index" "$error_file"
+      return 1
+    }
+    tree=$APPLIED_TREE
+    parent=$(rewrite_commit_tree "$commit" "$tree" "$parent") || {
+      rm -f "$index" "$error_file"
+      return 1
+    }
+  done
+  BUILT_TIP=$parent
+  rm -f "$index" "$error_file"
+  return 0
+}
+
+print_dependency_error() {
+  die "patchen '$1' avhenger av den aktive patchen '$2' (patcher kan ikke bygge på hverandre)"
+}
+
+check_dependencies() {
+  local requested=$1 requested_tip=$2 id name active_tip
+  for id in $(stack_patch_ids); do
+    name=$(patch_name_for_id "$id")
+    active_tip=$(source_tip_for_id "$id")
+    if git merge-base --is-ancestor "$active_tip" "$requested_tip" 2>/dev/null; then
+      print_dependency_error "$requested" "$name"
+    fi
+    if git merge-base --is-ancestor "$requested_tip" "$active_tip" 2>/dev/null; then
+      print_dependency_error "$name" "$requested"
+    fi
+  done
+}
+
+print_conflicts() {
+  local action=$1 patch=$2
+  if [ -n "$CONFLICT_FILES" ]; then
+    printf 'Kan ikke %s patchen %s på grunn av conflict i:\n' \
+      "$action" "$patch" >&2
+    printf '%s\n' "$CONFLICT_FILES" | sed 's/^/  /' >&2
+  else
+    printf 'Kan ikke %s patchen %s på grunn av conflict.\n' \
+      "$action" "$patch" >&2
+  fi
+}
+
+has_worktree_changes() {
+  [ -n "$(git status --porcelain --untracked-files=all)" ]
+}
+
+restore_stash() {
+  local oid=$1
+  git stash apply --index -q "$oid" 2>/dev/null ||
+    die "kunne ikke legge tilbake stashen $oid automatisk"
+}
+
+save_stack_metadata() {
+  local patch=$1 id=$2 source_base=$3 source_tip=$4 original_head=$5
+
+  git config --local "$(git_config_key branch)" "$CURRENT_BRANCH"
+  git config --local "$(git_config_key base)" "$STACK_BASE"
+  git update-ref "$STACK_REF/base" "$STACK_BASE"
+  git update-ref "$STACK_REF/feature-start" "$BUILT_PATCH_TIP"
+  git update-ref "$STACK_REF/head" "$BUILT_TIP"
+
+  if ! stack_patch_ids | grep -q "^$id$"; then
+    git config --local --add "$STACK_PREFIX.patches.value" "$id"
+    git config --local "$(patch_meta_key "$id" name)" "$patch"
+  fi
+  git config --local "$(patch_meta_key "$id" source)" "$patch"
+  git update-ref "$STACK_REF/patch/$id/base" "$source_base"
+  git update-ref "$STACK_REF/patch/$id/source" "$source_tip"
+  git config --local "$(patch_meta_key "$id" source-tip)" "$source_tip"
+  git config --local --add "$STACK_PREFIX.operations.value" \
+    "added $patch from $source_tip"
+  if [ -n "$original_head" ]; then
+    git update-ref "$STACK_REF/original-head" "$original_head"
+  fi
+}
+
+command_check_conflicts() {
+  [ "$#" -eq 1 ] || die "bruk: git patch check-conflicts <patch>"
+  local patch=$1 id
+
+  stack_setup
+  load_stack
+  id=$(patch_id "$patch")
+  if ! stack_patch_ids | grep -q "^$id$"; then
+    check_dependencies "$patch" "$(git rev-parse "refs/heads/$patch^{commit}" 2>/dev/null ||
+      die "fant ikke den lokale branchen '$patch'")"
+  fi
+  source_info "$patch"
+
+  if build_stack_tip "$id" "$patch" "$SOURCE_BASE" "$SOURCE_TIP"; then
+    printf 'Ingen conflict: patchen %s kan brukes uten konflikter.\n' "$patch"
+    return 0
+  fi
+  print_conflicts "bruke" "$patch"
+  printf 'Ingen endringer ble gjort i feature-branchen.\n' >&2
+  return 1
+}
+
+command_add() {
+  [ "$#" -eq 1 ] || die "bruk: git patch add <patch>"
+  local patch=$1 id original_head stash_oid= candidate_tip
+  local had_stash=0
+
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "ikke i et Git-repo"
+  stack_setup
+  load_stack
+  id=$(patch_id "$patch")
+  stack_patch_ids | grep -q "^$id$" &&
+    die "patchen '$patch' er allerede lagt til"
+
+  if git remote get-url origin >/dev/null 2>&1; then
+    git fetch -q origin 2>/dev/null || true
+  fi
+  source_info "$patch"
+  check_dependencies "$patch" "$SOURCE_TIP"
+  original_head=$(git rev-parse HEAD)
+  if has_worktree_changes; then
+    git stash push -u -q -m "git-patch: pending add $patch" ||
+      die "kunne ikke stash'e ucommittede endringer"
+    stash_oid=$(git rev-parse refs/stash)
+    had_stash=1
+  fi
+
+  if ! build_stack_tip "$id" "$patch" "$SOURCE_BASE" "$SOURCE_TIP"; then
+    print_conflicts "legge til" "$patch"
+    printf 'Ingen endringer ble gjort i feature-branchen.\n' >&2
+    if [ "$had_stash" -eq 1 ]; then
+      restore_stash "$stash_oid"
+      printf 'Dine ucommittede endringer ligger i stash@{0}.\n' >&2
+    fi
+    return 1
+  fi
+  candidate_tip=$BUILT_TIP
+
+  if ! git reset --hard -q "$candidate_tip"; then
+    if [ "$had_stash" -eq 1 ]; then
+      restore_stash "$stash_oid"
+    fi
+    die "kunne ikke oppdatere feature-branchen"
+  fi
+  if [ "$had_stash" -eq 1 ] &&
+    ! git stash apply --index -q "$stash_oid"; then
+    git reset --hard -q "$original_head"
+    restore_stash "$stash_oid"
+    printf 'Ingen endringer ble gjort i feature-branchen.\n' >&2
+    printf 'Dine ucommittede endringer ligger i stash@{0}.\n' >&2
+    return 1
+  fi
+  [ "$had_stash" -eq 0 ] || git stash drop -q "stash@{0}"
+
+  save_stack_metadata "$patch" "$id" "$SOURCE_BASE" "$SOURCE_TIP" "$original_head"
+
+  if [ "${REMOTE_NEWER-0}" -eq 1 ]; then
+    printf 'origin/%s er nyere enn lokal %s\n' "$patch" "$patch" >&2
+    printf 'Lokal %s ble lagt til. Oppdater den lokale %s-branchen og kjør `git patch sync %s` hvis remote-versjonen skal brukes.\n' \
+      "$patch" "$patch" "$patch" >&2
+  fi
+  printf 'La til patchen %s på feature-branchen.\n' "$patch"
+}
+
 case ${1-} in
   -h|--help|help)
     usage
     exit 0
     ;;
-  add|list|sync|check-conflicts|drop|log|publish-stacked)
+  add)
+    shift
+    command_add "$@"
+    ;;
+  check-conflicts)
+    shift
+    command_check_conflicts "$@"
+    ;;
+  list|sync|drop|log|publish-stacked)
     printf '%s: %s is not implemented yet\n' "$program" "$1" >&2
     exit 125
     ;;
