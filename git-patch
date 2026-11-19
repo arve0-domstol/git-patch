@@ -89,6 +89,7 @@ source_info() {
   local patch=$1 source="refs/heads/$patch" remote="refs/remotes/origin/$patch"
   local base source_tip
 
+  REMOTE_NEWER=0
   git rev-parse --verify "$source^{commit}" >/dev/null 2>&1 ||
     die "fant ikke den lokale branchen '$patch'"
   base=$(git merge-base "$source" origin/HEAD) ||
@@ -198,6 +199,76 @@ build_stack_tip() {
   BUILT_TIP=$parent
   rm -f "$index" "$error_file"
   return 0
+}
+
+build_stack_from_state() {
+  local i id name base snapshot parent tree commit index error_file
+  local first_parent feature_commits
+
+  index="$GIT_DIR/git-patch-index.$$"
+  error_file="$GIT_DIR/git-patch-error.$$"
+  rm -f "$index" "$error_file"
+  CONFLICT_FILES=
+  parent=$BUILD_BASE
+
+  for ((i = 0; i < ${#BUILD_IDS[@]}; i++)); do
+    id=${BUILD_IDS[$i]}
+    name=${BUILD_NAMES[$i]}
+    base=${BUILD_BASES[$i]}
+    snapshot=${BUILD_TIPS[$i]}
+    apply_tree_diff "$base" "$snapshot" "$parent" "$index" "$error_file" || {
+      rm -f "$index" "$error_file"
+      return 1
+    }
+    tree=$APPLIED_TREE
+    commit=$(printf 'git-patch: %s\n' "$name" |
+      git commit-tree "$tree" -p "$parent")
+    parent=$commit
+  done
+  BUILT_PATCH_TIP=$parent
+
+  feature_commits=$(git rev-list --reverse "$STACK_FEATURE_START..HEAD" --first-parent)
+  for commit in $feature_commits; do
+    first_parent=$(git rev-parse "$commit^1") || {
+      rm -f "$index" "$error_file"
+      return 1
+    }
+    apply_tree_diff "$first_parent" "$commit" "$parent" \
+      "$index" "$error_file" || {
+      rm -f "$index" "$error_file"
+      return 1
+    }
+    tree=$APPLIED_TREE
+    parent=$(rewrite_commit_tree "$commit" "$tree" "$parent") || {
+      rm -f "$index" "$error_file"
+      return 1
+    }
+  done
+  BUILT_TIP=$parent
+  rm -f "$index" "$error_file"
+  return 0
+}
+
+prepare_single_sync_build() {
+  local requested_id=$1 requested_base=$2 requested_tip=$3
+  local id
+
+  BUILD_BASE=$STACK_BASE
+  BUILD_IDS=()
+  BUILD_NAMES=()
+  BUILD_BASES=()
+  BUILD_TIPS=()
+  for id in $(stack_patch_ids); do
+    BUILD_IDS[${#BUILD_IDS[@]}]=$id
+    BUILD_NAMES[${#BUILD_NAMES[@]}]=$(patch_name_for_id "$id")
+    if [ "$id" = "$requested_id" ]; then
+      BUILD_BASES[${#BUILD_BASES[@]}]=$requested_base
+      BUILD_TIPS[${#BUILD_TIPS[@]}]=$requested_tip
+    else
+      BUILD_BASES[${#BUILD_BASES[@]}]=$(base_tip_for_id "$id")
+      BUILD_TIPS[${#BUILD_TIPS[@]}]=$(source_tip_for_id "$id")
+    fi
+  done
 }
 
 print_dependency_error() {
@@ -348,6 +419,299 @@ command_add() {
   printf 'La til patchen %s på feature-branchen.\n' "$patch"
 }
 
+warn_remote_newer() {
+  [ "${REMOTE_NEWER-0}" -eq 1 ] || return 0
+  printf 'origin/%s er nyere enn lokal %s\n' "$1" "$1" >&2
+  printf 'Lokal %s brukes. Oppdater den lokale %s-branchen og kjør `git patch sync %s` hvis remote-versjonen skal brukes.\n' \
+    "$1" "$1" "$1" >&2
+}
+
+stash_sync_work() {
+  SYNC_STASH_OID=
+  if has_worktree_changes; then
+    git stash push -u -q -m "git-patch: pending sync" ||
+      die "kunne ikke stash'e ucommittede endringer"
+    SYNC_STASH_OID=$(git rev-parse refs/stash)
+  fi
+}
+
+restore_sync_stash() {
+  local keep=$1
+  [ -n "$SYNC_STASH_OID" ] || return 0
+  if git stash apply --index -q "$SYNC_STASH_OID"; then
+    if [ "$keep" -eq 0 ]; then
+      git stash drop -q "stash@{0}"
+    fi
+    return 0
+  fi
+  printf 'Dine ucommittede endringer ligger i stash@{0}.\n' >&2
+  return 1
+}
+
+sync_conflict_failure() {
+  local patch=$1
+  print_conflicts "synkronisere" "$patch"
+  printf 'Ingen endringer ble gjort i feature-branchen.\n' >&2
+  if [ -n "$SYNC_STASH_OID" ]; then
+    restore_sync_stash 0 || true
+  fi
+  return 1
+}
+
+finish_sync_branch() {
+  local original_head=$1
+  local candidate_tip=$2
+
+  if ! git reset --hard -q "$candidate_tip"; then
+    git reset --hard -q "$original_head"
+    restore_sync_stash 0 || true
+    die "kunne ikke oppdatere feature-branchen"
+  fi
+  if [ -n "$SYNC_STASH_OID" ] &&
+    ! git stash apply --index -q "$SYNC_STASH_OID"; then
+    git reset --hard -q "$original_head"
+    if ! git stash apply --index -q "$SYNC_STASH_OID"; then
+      printf 'Dine ucommittede endringer ligger i stash@{0}.\n' >&2
+    fi
+    printf 'Ingen endringer ble gjort i feature-branchen.\n' >&2
+    return 1
+  fi
+  [ -z "$SYNC_STASH_OID" ] || git stash drop -q "stash@{0}"
+}
+
+save_synced_patch() {
+  local patch=$1 id=$2 source_base=$3 source_tip=$4
+
+  git config --local "$(patch_meta_key "$id" source)" "$patch"
+  git config --local "$(patch_meta_key "$id" source-tip)" "$source_tip"
+  git update-ref "$STACK_REF/patch/$id/base" "$source_base"
+  git update-ref "$STACK_REF/patch/$id/source" "$source_tip"
+  git update-ref "$STACK_REF/feature-start" "$BUILT_PATCH_TIP"
+  git update-ref "$STACK_REF/head" "$BUILT_TIP"
+  git config --local --add "$STACK_PREFIX.operations.value" \
+    "synced $patch from $source_tip"
+}
+
+command_sync_patch() {
+  [ "$#" -eq 1 ] || die "bruk: git patch sync [patch]"
+  local patch=$1 id original_head
+
+  stack_setup
+  load_stack
+  id=$(patch_id "$patch")
+  stack_patch_ids | grep -q "^$id$" ||
+    die "patchen '$patch' er ikke lagt til"
+
+  source_info "$patch"
+  prepare_single_sync_build "$id" "$SOURCE_BASE" "$SOURCE_TIP"
+  original_head=$(git rev-parse HEAD)
+  stash_sync_work
+
+  if ! build_stack_from_state; then
+    sync_conflict_failure "$patch"
+    return 1
+  fi
+  if ! finish_sync_branch "$original_head" "$BUILT_TIP"; then
+    return 1
+  fi
+  save_synced_patch "$patch" "$id" "$SOURCE_BASE" "$SOURCE_TIP"
+  warn_remote_newer "$patch"
+  printf 'Synkroniserte patchen %s.\n' "$patch"
+}
+
+patch_change_id() {
+  git diff --binary "$1" "$2" | git patch-id --stable |
+    awk 'NR == 1 { print $1 }'
+}
+
+patch_is_delivered() {
+  local old_base=$1 source_tip=$2 new_main=$3
+  local change_id main_commit index
+
+  if git merge-base --is-ancestor "$source_tip" "$new_main" 2>/dev/null; then
+    return 0
+  fi
+
+  change_id=$(patch_change_id "$old_base" "$source_tip")
+  if [ -z "$change_id" ]; then
+    return 0
+  fi
+  for main_commit in $(git rev-list "$STACK_BASE..$new_main"); do
+    if [ "$(git show --pretty=format: "$main_commit" | git patch-id --stable |
+      awk 'NR == 1 { print $1 }')" = "$change_id" ]; then
+      return 0
+    fi
+  done
+
+  index="$GIT_DIR/git-patch-delivery-check.$$"
+  rm -f "$index"
+  GIT_INDEX_FILE=$index git read-tree "$new_main" || {
+    rm -f "$index"
+    return 1
+  }
+  if git diff --binary --full-index "$old_base" "$source_tip" |
+    GIT_INDEX_FILE=$index git apply --cached --check --reverse \
+      --whitespace=nowarn - >/dev/null 2>&1; then
+    rm -f "$index"
+    return 0
+  fi
+  rm -f "$index"
+  return 1
+}
+
+patch_may_be_delivered() {
+  local old_base=$1 source_tip=$2 new_main=$3 path
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    if git diff --name-only "$STACK_BASE" "$new_main" | grep -Fxq "$path"; then
+      return 0
+    fi
+  done < <(git diff --name-only "$old_base" "$source_tip")
+  return 1
+}
+
+confirm_uncertain_delivery() {
+  local patch=$1 answer
+
+  printf "Patchen %s kan være bare delvis eller endret levert i main; du må bekrefte fjerning. [j/N] " \
+    "$patch" >&2
+  IFS= read -r answer || answer=n
+  case $answer in
+    j|J|ja|JA|y|Y|yes|YES) return 0 ;;
+    *)
+      printf 'Synkronisering avbrutt. Ingen endringer ble gjort.\n' >&2
+      return 1
+      ;;
+  esac
+}
+
+remove_patch_metadata() {
+  local id=$1
+
+  git config --local --unset-all "$STACK_PREFIX.patches.value" "^$id$" || true
+  git config --local --unset-all "$(patch_meta_key "$id" name)" || true
+  git config --local --unset-all "$(patch_meta_key "$id" source)" || true
+  git config --local --unset-all "$(patch_meta_key "$id" source-tip)" || true
+  git update-ref -d "$STACK_REF/patch/$id/base"
+  git update-ref -d "$STACK_REF/patch/$id/source"
+}
+
+save_full_sync_metadata() {
+  local i id patch
+
+  git config --local "$(git_config_key base)" "$BUILD_BASE"
+  git update-ref "$STACK_REF/base" "$BUILD_BASE"
+  for id in $(stack_patch_ids); do
+    if ! printf '%s\n' "${RETAINED_IDS[@]}" | grep -qx "$id"; then
+      remove_patch_metadata "$id"
+    fi
+  done
+  for ((i = 0; i < ${#BUILD_IDS[@]}; i++)); do
+    id=${BUILD_IDS[$i]}
+    patch=${BUILD_NAMES[$i]}
+    git update-ref "$STACK_REF/patch/$id/base" "${BUILD_BASES[$i]}"
+    git update-ref "$STACK_REF/patch/$id/source" "${BUILD_TIPS[$i]}"
+    git config --local "$(patch_meta_key "$id" source-tip)" "${BUILD_TIPS[$i]}"
+    git config --local --add "$STACK_PREFIX.operations.value" \
+      "synced $patch from ${BUILD_TIPS[$i]}"
+  done
+  for ((i = 0; i < ${#DELIVERED_IDS[@]}; i++)); do
+    patch=${DELIVERED_NAMES[$i]}
+    git config --local --add "$STACK_PREFIX.operations.value" \
+      "dropped $patch because its change was found in main"
+  done
+  git update-ref "$STACK_REF/feature-start" "$BUILT_PATCH_TIP"
+  git update-ref "$STACK_REF/head" "$BUILT_TIP"
+}
+
+command_sync_all() {
+  local id patch active_base active_tip source_tip original_head new_main
+  local delivered uncertain
+
+  stack_setup
+  load_stack
+  [ -n "$STACK_PATCHES" ] || die "ingen aktive patcher å synkronisere"
+  git fetch -q origin || die "kunne ikke hente fra origin"
+  new_main=$(git rev-parse "origin/HEAD^{commit}") ||
+    die "fant ikke origin/HEAD"
+
+  BUILD_BASE=$new_main
+  BUILD_IDS=()
+  BUILD_NAMES=()
+  BUILD_BASES=()
+  BUILD_TIPS=()
+  RETAINED_IDS=()
+  DELIVERED_IDS=()
+  DELIVERED_NAMES=()
+
+  for id in $(stack_patch_ids); do
+    patch=$(patch_name_for_id "$id")
+    source_info "$patch"
+    active_base=$(base_tip_for_id "$id")
+    active_tip=$(source_tip_for_id "$id")
+    source_tip=$SOURCE_TIP
+    warn_remote_newer "$patch"
+
+    delivered=0
+    if patch_is_delivered "$active_base" "$active_tip" "$new_main" ||
+      { [ "$active_tip" != "$source_tip" ] &&
+        patch_is_delivered "$SOURCE_BASE" "$source_tip" "$new_main"; }; then
+      delivered=1
+    fi
+    if [ "$delivered" -eq 1 ]; then
+      DELIVERED_IDS[${#DELIVERED_IDS[@]}]=$id
+      DELIVERED_NAMES[${#DELIVERED_NAMES[@]}]=$patch
+      continue
+    fi
+
+    uncertain=0
+    if patch_may_be_delivered "$active_base" "$active_tip" "$new_main" ||
+      { [ "$active_tip" != "$source_tip" ] &&
+        patch_may_be_delivered "$SOURCE_BASE" "$source_tip" "$new_main"; }; then
+      uncertain=1
+    fi
+    if [ "$uncertain" -eq 1 ]; then
+      if ! confirm_uncertain_delivery "$patch"; then
+        return 1
+      fi
+      DELIVERED_IDS[${#DELIVERED_IDS[@]}]=$id
+      DELIVERED_NAMES[${#DELIVERED_NAMES[@]}]=$patch
+      continue
+    fi
+    BUILD_IDS[${#BUILD_IDS[@]}]=$id
+    BUILD_NAMES[${#BUILD_NAMES[@]}]=$patch
+    BUILD_BASES[${#BUILD_BASES[@]}]=$SOURCE_BASE
+    BUILD_TIPS[${#BUILD_TIPS[@]}]=$source_tip
+    RETAINED_IDS[${#RETAINED_IDS[@]}]=$id
+  done
+
+  original_head=$(git rev-parse HEAD)
+  stash_sync_work
+  if ! build_stack_from_state; then
+    sync_conflict_failure "stacken"
+    return 1
+  fi
+  if ! finish_sync_branch "$original_head" "$BUILT_TIP"; then
+    return 1
+  fi
+  save_full_sync_metadata
+  printf 'Synkroniserte patch-stacken mot oppdatert main.\n'
+}
+
+command_sync() {
+  case $# in
+    0) command_sync_all ;;
+    1) command_sync_patch "$1" ;;
+    *) die "bruk: git patch sync [patch]" ;;
+  esac
+}
+
+command_log() {
+  stack_setup
+  git config --local --get-all "$STACK_PREFIX.operations.value" 2>/dev/null ||
+    printf 'Ingen stack-historikk ennå.\n'
+}
+
 case ${1-} in
   -h|--help|help)
     usage
@@ -361,7 +725,16 @@ case ${1-} in
     shift
     command_check_conflicts "$@"
     ;;
-  list|sync|drop|log|publish-stacked)
+  sync)
+    shift
+    command_sync "$@"
+    ;;
+  log)
+    shift
+    [ "$#" -eq 0 ] || die "bruk: git patch log"
+    command_log
+    ;;
+  list|drop|publish-stacked)
     printf '%s: %s is not implemented yet\n' "$program" "$1" >&2
     exit 125
     ;;
