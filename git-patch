@@ -786,13 +786,22 @@ restore_drop_stash() {
   local keep=$1
   [ -n "$DROP_STASH_OID" ] || return 0
   if git stash apply --index -q "$DROP_STASH_OID"; then
-    if [ "$keep" -eq 0 ]; then
+    if [ "$keep" -eq 0 ] &&
+      [ "$(git rev-parse --verify -q refs/stash || true)" = "$DROP_STASH_OID" ]; then
       git stash drop -q "stash@{0}"
     fi
     return 0
   fi
   printf 'Dine ucommittede endringer ligger i stash@{0}.\n' >&2
   return 1
+}
+
+rollback_drop_branch() {
+  local original_head=$1
+
+  git reset --hard -q "$original_head" || return 1
+  git clean -fdq || return 1
+  restore_drop_stash 0
 }
 
 drop_conflict_failure() {
@@ -809,35 +818,118 @@ finish_drop_branch() {
   local original_head=$1 candidate_tip=$2
 
   if ! git reset --hard -q "$candidate_tip"; then
-    git reset --hard -q "$original_head"
-    restore_drop_stash 0 || true
+    rollback_drop_branch "$original_head" || true
+    rm -f "$DROP_CONFIG_SNAPSHOT"
     die "kunne ikke oppdatere feature-branchen"
   fi
   if [ -n "$DROP_STASH_OID" ] &&
     ! git stash apply --index -q "$DROP_STASH_OID"; then
-    git reset --hard -q "$original_head"
-    restore_drop_stash 1 || true
+    rollback_drop_branch "$original_head" || true
     printf 'Ingen endringer ble gjort i feature-branchen.\n' >&2
     return 1
+  fi
+}
+
+snapshot_drop_metadata() {
+  local config id ref oid
+
+  DROP_CONFIG=$(git rev-parse --git-path config) ||
+    die "fant ikke lokal Git-konfigurasjon"
+  DROP_CONFIG_SNAPSHOT="$GIT_DIR/git-patch-drop-config.$$"
+  cp "$DROP_CONFIG" "$DROP_CONFIG_SNAPSHOT" ||
+    die "kunne ikke ta sikkerhetskopi av stack-metadata"
+  DROP_REF_NAMES=(
+    "$STACK_REF/base"
+    "$STACK_REF/feature-start"
+    "$STACK_REF/head"
+  )
+  for id in "${DROPPED_IDS[@]}"; do
+    DROP_REF_NAMES[${#DROP_REF_NAMES[@]}]="$STACK_REF/patch/$id/base"
+    DROP_REF_NAMES[${#DROP_REF_NAMES[@]}]="$STACK_REF/patch/$id/source"
+  done
+  DROP_REF_OIDS=()
+  for ref in "${DROP_REF_NAMES[@]}"; do
+    oid=$(git rev-parse --verify "$ref^{commit}" 2>/dev/null || true)
+    DROP_REF_OIDS[${#DROP_REF_OIDS[@]}]=$oid
+  done
+  DROP_REFS_UPDATED=0
+}
+
+restore_drop_metadata() {
+  local i
+
+  cp "$DROP_CONFIG_SNAPSHOT" "$DROP_CONFIG" || return 1
+  if [ "$DROP_REFS_UPDATED" -eq 1 ]; then
+    {
+      for ((i = 0; i < ${#DROP_REF_NAMES[@]}; i++)); do
+        if [ -n "${DROP_REF_OIDS[$i]}" ]; then
+          printf 'update %s %s\n' \
+            "${DROP_REF_NAMES[$i]}" "${DROP_REF_OIDS[$i]}"
+        else
+          printf 'delete %s\n' "${DROP_REF_NAMES[$i]}"
+        fi
+      done
+    } | git update-ref --stdin || return 1
   fi
 }
 
 save_drop_metadata() {
   local id patch i=0
 
-  git config --local "$(git_config_key base)" "$BUILD_BASE" || return 1
+  git config --local "$(git_config_key base)" "$BUILD_BASE" || {
+    restore_drop_metadata || true
+    return 1
+  }
   for id in "${DROPPED_IDS[@]}"; do
-    remove_patch_metadata "$id" || return 1
+    git config --local --unset-all \
+      "$STACK_PREFIX.patches.value" "^$id$" || [ "$?" -eq 5 ] || {
+        restore_drop_metadata || true
+        return 1
+      }
+    git config --local --unset-all "$(patch_meta_key "$id" name)" ||
+      [ "$?" -eq 5 ] || {
+        restore_drop_metadata || true
+        return 1
+      }
+    git config --local --unset-all "$(patch_meta_key "$id" source)" ||
+      [ "$?" -eq 5 ] || {
+        restore_drop_metadata || true
+        return 1
+      }
+    git config --local --unset-all "$(patch_meta_key "$id" source-tip)" ||
+      [ "$?" -eq 5 ] || {
+        restore_drop_metadata || true
+        return 1
+      }
     patch=${DROPPED_NAMES[$i]}
     git config --local --add "$STACK_PREFIX.operations.value" \
-      "dropped $patch" || return 1
+      "dropped $patch" || {
+        restore_drop_metadata || true
+        return 1
+      }
     i=$((i + 1))
   done
-  printf 'update %s %s\nupdate %s %s\nupdate %s %s\n' \
-    "$STACK_REF/base" "$BUILD_BASE" \
-    "$STACK_REF/feature-start" "$BUILT_PATCH_TIP" \
-    "$STACK_REF/head" "$BUILT_TIP" |
-    git update-ref --stdin || return 1
+  {
+    printf 'update %s %s %s\n' \
+      "$STACK_REF/base" "$BUILD_BASE" "${DROP_REF_OIDS[0]}"
+    printf 'update %s %s %s\n' \
+      "$STACK_REF/feature-start" "$BUILT_PATCH_TIP" "${DROP_REF_OIDS[1]}"
+    printf 'update %s %s %s\n' \
+      "$STACK_REF/head" "$BUILT_TIP" "${DROP_REF_OIDS[2]}"
+    i=3
+    for id in "${DROPPED_IDS[@]}"; do
+      printf 'delete %s %s\n' \
+        "$STACK_REF/patch/$id/base" "${DROP_REF_OIDS[$i]}"
+      i=$((i + 1))
+      printf 'delete %s %s\n' \
+        "$STACK_REF/patch/$id/source" "${DROP_REF_OIDS[$i]}"
+      i=$((i + 1))
+    done
+  } | git update-ref --stdin || {
+    restore_drop_metadata || true
+    return 1
+  }
+  DROP_REFS_UPDATED=1
 }
 
 command_drop() {
@@ -866,23 +958,31 @@ command_drop() {
   prepare_drop_build "$requested_id"
 
   original_head=$(git rev-parse HEAD)
+  snapshot_drop_metadata
   stash_drop_work
   if ! build_stack_from_state; then
     drop_conflict_failure "${requested:-stacken}"
+    rm -f "$DROP_CONFIG_SNAPSHOT"
     return 1
   fi
   candidate_tip=$BUILT_TIP
   if ! finish_drop_branch "$original_head" "$candidate_tip"; then
+    rm -f "$DROP_CONFIG_SNAPSHOT"
     return 1
   fi
   save_drop_metadata || {
-    git reset --hard -q "$original_head"
-    if [ -n "$DROP_STASH_OID" ]; then
-      restore_drop_stash 1 || true
-    fi
+    rollback_drop_branch "$original_head" || true
+    rm -f "$DROP_CONFIG_SNAPSHOT"
     die "kunne ikke lagre oppdatert stack-metadata"
   }
-  [ -z "$DROP_STASH_OID" ] || git stash drop -q "stash@{0}"
+  if [ -n "$DROP_STASH_OID" ] &&
+    ! git stash drop -q "stash@{0}"; then
+    restore_drop_metadata || true
+    rollback_drop_branch "$original_head" || true
+    rm -f "$DROP_CONFIG_SNAPSHOT"
+    die "kunne ikke fullføre oppdatering av stash"
+  fi
+  rm -f "$DROP_CONFIG_SNAPSHOT"
 
   for patch in "${DROPPED_NAMES[@]}"; do
     printf 'Fjernet patchen %s fra stacken.\n' "$patch"
