@@ -43,7 +43,9 @@ assert_succeeds() {
 }
 
 assert_fails() {
-  "$@" >/dev/null 2>&1 && fail "command should fail: $*"
+  if "$@" >/dev/null 2>&1; then
+    fail "command should fail: $*"
+  fi
 }
 
 init_repo() {

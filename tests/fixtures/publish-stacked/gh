@@ -1,3 +1,42 @@
 #!/usr/bin/env bash
 
 printf '%s\n' "$*" >>"$GH_LOG"
+
+git_dir=$(git rev-parse --git-dir 2>/dev/null || printf '.git')
+state=$git_dir/gh-stack
+
+if [ "${1-}" = stack ]; then
+  case "${2-}" in
+    --help) exit 0 ;;
+    view)
+      if [ -s "$state" ]; then
+        printf '{"branches":[{"name":"feature"}]}\n'
+        exit 0
+      fi
+      exit 1
+      ;;
+    unstack)
+      printf '{\n  "stacks": []\n}\n' >"$state"
+      exit 0
+      ;;
+    init)
+      printf 'partial tracking\n' >"$state"
+      printf 'partial lock\n' >"$state.lock"
+      if [ "${GH_FAIL_INIT-0}" = 1 ]; then
+        exit 1
+      fi
+      printf 'published tracking\n' >"$state"
+      exit 0
+      ;;
+    submit)
+      if [ "${GH_FAIL_SUBMIT-0}" = 1 ]; then
+        printf 'failed submit tracking\n' >"$state"
+        printf 'failed lock\n' >"$state-operation.lock"
+        exit 1
+      fi
+      exit 0
+      ;;
+  esac
+fi
+
+exit 0
