@@ -8,41 +8,24 @@ godkjenning og bli tilgjengelig på `main` mens feature-arbeidet pågår. Da kan
 `git-patch` fjerne patchen fra feature-branchen og rebase feature-arbeidet på
 den oppdaterte `main`.
 
-## Modell
+## Installere
+Gitt at du har ~/bin i PATH:
 
-Patchen er den **samlede diffen** mellom en patch-branch og merge-base med
-`origin/HEAD`. Commitrekkefølgen eller antall commits i patch-branchen spiller
-ingen rolle.
+```shell
+# lenke
+ln -s $(pwd)/git-patch ~/bin/git-patch
 
-For eksempel vil dette:
-
-```text
-main
-  \
-   cache: A -- B -- C
-feature:           A' -- B' -- egen-endring
+# eller kopiere
+cp git-patch ~/bin/git-patch
 ```
 
-bli behandlet som om `cache` er én endring, pluss feature-branchens egne
-endringer.
-
-En aktiv stack er alltid lineær:
-
-```text
-oppdatert main -> patcher -> eget arbeid
-```
-
-Avgrensninger:
-
-- patcher kan ikke bygge på hverandre;
-- patch-brancher med merge-commits støttes ikke;
-- én arbeidsbranch har én lokal patch-stack;
-- stack-metadata lagres lokalt i Git og deles mellom worktrees i samme klone;
-- en annen klone må opprette sin egen stack igjen.
 
 ## Kommandoer
 
 ```shell
+# se alle kommandoer
+git patch help
+
 # Legg til den totale diffen fra cache
 git patch add cache
 
@@ -163,6 +146,39 @@ synced logging from c7efb20
 dropped cache because its change was found in main
 rolled back sync after conflicts
 ```
+
+## Modell
+
+Patchen er den **samlede diffen** mellom en patch-branch og merge-base med
+`origin/HEAD`. Commitrekkefølgen eller antall commits i patch-branchen spiller
+ingen rolle.
+
+For eksempel vil dette:
+
+```text
+main
+  \
+   cache: A -- B -- C
+feature:           A' -- B' -- egen-endring
+```
+
+bli behandlet som om `cache` er én endring, pluss feature-branchens egne
+endringer.
+
+En aktiv stack er alltid lineær:
+
+```text
+oppdatert main -> patcher -> eget arbeid
+```
+
+Avgrensninger:
+
+- patcher kan ikke bygge på hverandre;
+- patch-brancher med merge-commits støttes ikke;
+- én arbeidsbranch har én lokal patch-stack;
+- stack-metadata lagres lokalt i Git og deles mellom worktrees i samme klone;
+- en annen klone må opprette sin egen stack igjen.
+
 
 ## Konflikter og sikkerhet
 
@@ -310,6 +326,3 @@ Kjør hele testsuiten fra rotmappen i repoet:
 
 Hver test oppretter et midlertidig Git-repo med `mktemp -d` og bruker
 uavhengige fixtures fra `tests/fixtures/`.
-
-Før kommandoene er implementert, er det forventet at testene rapporterer
-19 feil og at kun `git-patch --help` passerer.

@@ -18,7 +18,7 @@ Commands:
   log                    Show local stack history
   publish-stacked        Publish the stack as stacked pull requests
 
-Run 'git patch --help' to show this help.
+Run 'git patch help' to show this help.
 EOF
 }
 
