@@ -35,14 +35,16 @@ patch_id() {
   printf '%s' "$1" | git hash-object --stdin
 }
 
-stack_setup() {
+stack_context() {
   CURRENT_BRANCH=$(git symbolic-ref -q --short HEAD) ||
     die "du må stå på en lokal branch"
   STACK_ID=$(printf '%s' "$CURRENT_BRANCH" | git hash-object --stdin)
   STACK_PREFIX="git-patch.$STACK_ID"
   GIT_DIR=$(git rev-parse --git-dir) || die "ikke i et Git-repo"
   STACK_REF="refs/git-patch/stacks/$STACK_ID"
+}
 
+stack_base_setup() {
   STACK_BASE=$(git config --local --get "$(git_config_key base)" || true)
   if [ -n "$STACK_BASE" ]; then
     STACK_FEATURE_START=$(git rev-parse "$STACK_REF/feature-start") ||
@@ -55,6 +57,11 @@ stack_setup() {
   STACK_BASE=$(git merge-base HEAD origin/HEAD) ||
     die "fant ikke felles base med origin/HEAD"
   STACK_FEATURE_START=$STACK_BASE
+}
+
+stack_setup() {
+  stack_context
+  stack_base_setup
 }
 
 load_stack() {
@@ -755,27 +762,30 @@ list_patch_delivery() {
 }
 
 list_patch_conflicts() {
-  local requested_id=$1 requested_base=$2 requested_tip=$3
-  local id base snapshot parent tree index error_file patch_parent commit first_parent
-  local feature_commits
+  local i id base snapshot parent tree index error_file patch_parent commit first_parent
+  local feature_commits simulation_objects real_objects
 
   index="$GIT_DIR/git-patch-list-index.$$"
   error_file="$GIT_DIR/git-patch-list-error.$$"
+  simulation_objects="$GIT_DIR/git-patch-list-objects.$$"
+  real_objects=$(git rev-parse --git-path objects)
   rm -f "$index" "$error_file"
+  rm -rf "$simulation_objects"
+  mkdir -p "$simulation_objects"
+  simulation_objects=$(cd "$simulation_objects" && pwd)
+  real_objects=$(cd "$real_objects" && pwd)
   CONFLICT_FILES=
   parent=$STACK_BASE
-  for id in $(stack_patch_ids); do
-    if [ "$id" = "$requested_id" ]; then
-      base=$requested_base
-      snapshot=$requested_tip
-    else
-      base=$(base_tip_for_id "$id")
-      snapshot=$(source_tip_for_id "$id")
-    fi
-    if ! apply_tree_diff "$base" "$snapshot" "$parent" "$index" "$error_file" \
+  for ((i = 0; i < ${#LIST_IDS[@]}; i++)); do
+    base=${LIST_BASES[$i]}
+    snapshot=${LIST_TIPS[$i]}
+    if ! GIT_OBJECT_DIRECTORY=$simulation_objects \
+      GIT_ALTERNATE_OBJECT_DIRECTORIES=$real_objects \
+      apply_tree_diff "$base" "$snapshot" "$parent" "$index" "$error_file" \
       >/dev/null 2>&1; then
       LIST_CONFLICTS=${CONFLICT_FILES:-detected}
       rm -f "$index" "$error_file"
+      rm -rf "$simulation_objects"
       return
     fi
     parent=$APPLIED_TREE
@@ -787,34 +797,53 @@ list_patch_conflicts() {
     first_parent=$(git rev-parse "$commit^1") || {
       LIST_CONFLICTS=unknown
       rm -f "$index" "$error_file"
+      rm -rf "$simulation_objects"
       return
     }
-    if ! apply_tree_diff "$first_parent" "$commit" "$parent" \
-      "$index" "$error_file" >/dev/null 2>&1; then
+    if ! GIT_OBJECT_DIRECTORY=$simulation_objects \
+      GIT_ALTERNATE_OBJECT_DIRECTORIES=$real_objects \
+      apply_tree_diff "$first_parent" "$commit" "$parent" \
+        "$index" "$error_file" >/dev/null 2>&1; then
       LIST_CONFLICTS=${CONFLICT_FILES:-detected}
       rm -f "$index" "$error_file"
+      rm -rf "$simulation_objects"
       return
     fi
     parent=$APPLIED_TREE
   done
   LIST_CONFLICTS=none
   rm -f "$index" "$error_file"
+  rm -rf "$simulation_objects"
 }
 
 command_list() {
   [ "$#" -eq 0 ] || die "bruk: git patch list"
   local id patch source current_tip active_tip active_base source_base
-  local source_state order=0
+  local source_state conflict_reason order=0 i
+  local conflict_detail=
 
-  stack_setup
+  stack_context
   load_stack
   if [ -z "$STACK_PATCHES" ]; then
     printf '0 active patches\n'
     return
   fi
+  stack_base_setup
+
+  LIST_IDS=()
+  LIST_NAMES=()
+  LIST_SOURCES=()
+  LIST_STATES=()
+  LIST_ACTIVE_BASES=()
+  LIST_ACTIVE_TIPS=()
+  LIST_BASES=()
+  LIST_TIPS=()
+  LIST_DELIVERIES=()
 
   for id in $(stack_patch_ids); do
-    order=$((order + 1))
+    source_base=
+    source_state=
+    conflict_reason=
     patch=$(patch_name_for_id "$id")
     source=$(git config --local --get "$(patch_meta_key "$id" source)" ||
       printf '%s' "$patch")
@@ -830,9 +859,18 @@ command_list() {
       source_state=outdated
     fi
 
+    LIST_IDS[${#LIST_IDS[@]}]=$id
+    LIST_NAMES[${#LIST_NAMES[@]}]=$patch
+    LIST_SOURCES[${#LIST_SOURCES[@]}]=$source
+    LIST_STATES[${#LIST_STATES[@]}]=$source_state
+    LIST_ACTIVE_BASES[${#LIST_ACTIVE_BASES[@]}]=$active_base
+    LIST_ACTIVE_TIPS[${#LIST_ACTIVE_TIPS[@]}]=$active_tip
+    LIST_TIPS[${#LIST_TIPS[@]}]=${current_tip:-}
+
     list_patch_delivery "$active_base" "$active_tip"
+    LIST_DELIVERIES[${#LIST_DELIVERIES[@]}]=$LIST_DELIVERY
     if [ -z "$current_tip" ]; then
-      LIST_CONFLICTS=unknown
+      conflict_reason=unknown
     else
       if [ "$current_tip" = "$active_tip" ]; then
         source_base=$active_base
@@ -840,17 +878,29 @@ command_list() {
         source_base=$(git merge-base "$current_tip" origin/HEAD 2>/dev/null || true)
       fi
       if [ -z "$source_base" ]; then
-        LIST_CONFLICTS=unknown
+        conflict_reason=unknown
       elif [ -n "$(git rev-list --merges "$source_base..$current_tip")" ]; then
-        LIST_CONFLICTS="unknown (source contains a merge commit)"
-      else
-        list_patch_conflicts "$id" "$source_base" "$current_tip"
+        conflict_reason="unknown (source contains a merge commit)"
       fi
     fi
+    LIST_BASES[${#LIST_BASES[@]}]=${source_base:-}
+    if [ -z "$conflict_detail" ] && [ -n "$conflict_reason" ]; then
+      conflict_detail=$conflict_reason
+    fi
+  done
 
-    printf '%s. %s\n' "$order" "$patch"
-    printf '   source: %s (%s)\n' "$source" "$source_state"
-    printf '   delivery: %s\n' "$LIST_DELIVERY"
+  if [ -z "$conflict_detail" ]; then
+    list_patch_conflicts
+  else
+    LIST_CONFLICTS=$conflict_detail
+  fi
+
+  for ((i = 0; i < ${#LIST_IDS[@]}; i++)); do
+    order=$((order + 1))
+    printf '%s. %s\n' "$order" "${LIST_NAMES[$i]}"
+    printf '   source: %s (%s)\n' "${LIST_SOURCES[$i]}" \
+      "${LIST_STATES[$i]}"
+    printf '   delivery: %s\n' "${LIST_DELIVERIES[$i]}"
     printf '   conflicts: %s\n' "$(printf '%s' "$LIST_CONFLICTS" |
       tr '\n' ',' | sed 's/,$//; s/,/, /g')"
   done
