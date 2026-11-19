@@ -780,15 +780,17 @@ list_patch_conflicts() {
   simulation_objects=$(cd "$simulation_objects" && pwd)
   real_objects=$(cd "$real_objects" && pwd)
   CONFLICT_FILES=
+  LIST_STACK_CONFLICTS=none
   parent=$STACK_BASE
   for ((i = 0; i < ${#LIST_IDS[@]}; i++)); do
     base=${LIST_BASES[$i]}
     snapshot=${LIST_TIPS[$i]}
+    CONFLICT_FILES=
     if ! GIT_OBJECT_DIRECTORY=$simulation_objects \
       GIT_ALTERNATE_OBJECT_DIRECTORIES=$real_objects \
       apply_tree_diff "$base" "$snapshot" "$parent" "$index" "$error_file" \
       >/dev/null 2>&1; then
-      LIST_CONFLICTS=${CONFLICT_FILES:-detected}
+      LIST_CONFLICTS[$i]=${CONFLICT_FILES:-detected}
       rm -f "$index" "$error_file"
       rm -rf "$simulation_objects"
       return
@@ -800,23 +802,23 @@ list_patch_conflicts() {
   feature_commits=$(git rev-list --reverse "$patch_parent..HEAD" --first-parent)
   for commit in $feature_commits; do
     first_parent=$(git rev-parse "$commit^1") || {
-      LIST_CONFLICTS=unknown
+      LIST_STACK_CONFLICTS=unknown
       rm -f "$index" "$error_file"
       rm -rf "$simulation_objects"
       return
     }
+    CONFLICT_FILES=
     if ! GIT_OBJECT_DIRECTORY=$simulation_objects \
       GIT_ALTERNATE_OBJECT_DIRECTORIES=$real_objects \
       apply_tree_diff "$first_parent" "$commit" "$parent" \
         "$index" "$error_file" >/dev/null 2>&1; then
-      LIST_CONFLICTS=${CONFLICT_FILES:-detected}
+      LIST_STACK_CONFLICTS=${CONFLICT_FILES:-detected}
       rm -f "$index" "$error_file"
       rm -rf "$simulation_objects"
       return
     fi
     parent=$APPLIED_TREE
   done
-  LIST_CONFLICTS=none
   rm -f "$index" "$error_file"
   rm -rf "$simulation_objects"
 }
@@ -825,7 +827,7 @@ command_list() {
   [ "$#" -eq 0 ] || die "bruk: git patch list"
   local id patch source current_tip active_tip active_base source_base
   local source_state conflict_reason order=0 i
-  local conflict_detail=
+  local can_replay=1
 
   stack_context
   load_stack
@@ -844,6 +846,8 @@ command_list() {
   LIST_BASES=()
   LIST_TIPS=()
   LIST_DELIVERIES=()
+  LIST_CONFLICTS=()
+  LIST_STACK_CONFLICTS=none
 
   for id in $(stack_patch_ids); do
     source_base=
@@ -889,15 +893,18 @@ command_list() {
       fi
     fi
     LIST_BASES[${#LIST_BASES[@]}]=${source_base:-}
-    if [ -z "$conflict_detail" ] && [ -n "$conflict_reason" ]; then
-      conflict_detail=$conflict_reason
+    if [ -n "$conflict_reason" ]; then
+      LIST_CONFLICTS[${#LIST_CONFLICTS[@]}]=$conflict_reason
+      can_replay=0
+    else
+      LIST_CONFLICTS[${#LIST_CONFLICTS[@]}]=none
     fi
   done
 
-  if [ -z "$conflict_detail" ]; then
+  if [ "$can_replay" -eq 1 ]; then
     list_patch_conflicts
   else
-    LIST_CONFLICTS=$conflict_detail
+    LIST_STACK_CONFLICTS=unknown
   fi
 
   for ((i = 0; i < ${#LIST_IDS[@]}; i++)); do
@@ -906,9 +913,11 @@ command_list() {
     printf '   source: %s (%s)\n' "${LIST_SOURCES[$i]}" \
       "${LIST_STATES[$i]}"
     printf '   delivery: %s\n' "${LIST_DELIVERIES[$i]}"
-    printf '   conflicts: %s\n' "$(printf '%s' "$LIST_CONFLICTS" |
+    printf '   conflicts: %s\n' "$(printf '%s' "${LIST_CONFLICTS[$i]}" |
       tr '\n' ',' | sed 's/,$//; s/,/, /g')"
   done
+  printf '   stack conflicts: %s\n' "$(printf '%s' "$LIST_STACK_CONFLICTS" |
+    tr '\n' ',' | sed 's/,$//; s/,/, /g')"
 }
 
 command_log() {

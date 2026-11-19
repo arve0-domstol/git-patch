@@ -51,7 +51,14 @@ assert_contains "$output" "cache"
 assert_contains "$output" "logging"
 assert_contains "$output" "source: cache (outdated)"
 assert_contains "$output" "source: logging (outdated)"
-assert_contains "$output" "conflicts: app.txt"
+cache_output=$(printf '%s\n' "$output" |
+  sed -n '/^1\. cache$/,/^2\./p')
+logging_output=$(printf '%s\n' "$output" |
+  sed -n '/^2\. logging$/,/^   stack conflicts:/p')
+assert_contains "$cache_output" "conflicts: none"
+assert_not_contains "$cache_output" "conflicts: app.txt"
+assert_contains "$logging_output" "conflicts: app.txt"
+assert_contains "$output" "stack conflicts: none"
 assert_equals "$objects_before" "$(git count-objects -v)"
 assert_equals "$head_before" "$(git rev-parse HEAD)"
 assert_equals "$status_before" "$(git status --porcelain --untracked-files=all)"
