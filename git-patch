@@ -94,7 +94,7 @@ stack_patch_ids() {
 
 source_info() {
   local patch=$1 source="refs/heads/$patch" remote="refs/remotes/origin/$patch"
-  local base source_tip
+  local base source_tip active_tip active_base id
 
   REMOTE_NEWER=0
   git rev-parse --verify "$source^{commit}" >/dev/null 2>&1 ||
@@ -111,6 +111,15 @@ source_info() {
       git merge-base --is-ancestor "$source_tip" "$remote_tip"; then
       REMOTE_NEWER=1
     fi
+  fi
+  id=$(patch_id "$patch")
+  active_tip=$(git rev-parse --verify "$STACK_REF/patch/$id/source^{commit}" \
+    2>/dev/null || true)
+  active_base=$(git rev-parse --verify "$STACK_REF/patch/$id/base^{commit}" \
+    2>/dev/null || true)
+  if [ -n "$active_tip" ] && [ -n "$active_base" ] &&
+    git merge-base --is-ancestor "$active_tip" "$source_tip" 2>/dev/null; then
+    base=$active_base
   fi
   SOURCE_BASE=$base
   SOURCE_TIP=$source_tip
@@ -228,8 +237,13 @@ build_stack_from_state() {
       return 1
     }
     tree=$APPLIED_TREE
-    commit=$(printf 'git-patch: %s\n' "$name" |
-      git commit-tree "$tree" -p "$parent")
+    if [ "$base" = "$parent" ] &&
+      [ "$(git rev-parse "$snapshot^{tree}")" = "$tree" ]; then
+      commit=$snapshot
+    else
+      commit=$(printf 'git-patch: %s\n' "$name" |
+        git commit-tree "$tree" -p "$parent")
+    fi
     parent=$commit
   done
   BUILT_PATCH_TIP=$parent
@@ -1197,12 +1211,182 @@ command_log() {
   fi
 }
 
+build_publish_stack() {
+  local i id name base snapshot parent tree commit first_parent error_file index ref
+  local feature_commits
+
+  index="$GIT_DIR/git-patch-publish-index.$$"
+  error_file="$GIT_DIR/git-patch-publish-error.$$"
+  rm -f "$index" "$error_file"
+  PUBLISH_BRANCHES=()
+  PUBLISH_TIPS=()
+  PUBLISH_BASES=()
+  PUBLISH_TEMP_REFS=()
+  parent=$STACK_BASE
+
+  for id in $(stack_patch_ids); do
+    name=$(git config --local --get "$(patch_meta_key "$id" source)" ||
+      patch_name_for_id "$id")
+    base=$(base_tip_for_id "$id")
+    snapshot=$(source_tip_for_id "$id")
+    apply_tree_diff "$base" "$snapshot" "$parent" "$index" "$error_file" || {
+      rm -f "$index" "$error_file"
+      return 1
+    }
+    tree=$APPLIED_TREE
+    if [ "$base" = "$parent" ] &&
+      [ "$(git rev-parse "$snapshot^{tree}")" = "$tree" ]; then
+      commit=$snapshot
+    else
+      commit=$(printf 'git-patch: %s\n' "$name" |
+        git commit-tree "$tree" -p "$parent") || {
+        rm -f "$index" "$error_file"
+        return 1
+      }
+    fi
+    PUBLISH_BRANCHES[${#PUBLISH_BRANCHES[@]}]=$name
+    PUBLISH_TIPS[${#PUBLISH_TIPS[@]}]=$commit
+    PUBLISH_BASES[${#PUBLISH_BASES[@]}]=$parent
+    parent=$commit
+  done
+  PUBLISH_FEATURE_START=$parent
+
+  feature_commits=$(git rev-list --reverse \
+    "$STACK_FEATURE_START..HEAD" --first-parent)
+  for commit in $feature_commits; do
+    first_parent=$(git rev-parse "$commit^1") || {
+      rm -f "$index" "$error_file"
+      return 1
+    }
+    apply_tree_diff "$first_parent" "$commit" "$parent" \
+      "$index" "$error_file" || {
+      rm -f "$index" "$error_file"
+      return 1
+    }
+    tree=$APPLIED_TREE
+    parent=$(rewrite_commit_tree "$commit" "$tree" "$parent") || {
+      rm -f "$index" "$error_file"
+      return 1
+    }
+  done
+
+  PUBLISH_FEATURE_TIP=$parent
+  PUBLISH_BRANCHES[${#PUBLISH_BRANCHES[@]}]=$CURRENT_BRANCH
+  PUBLISH_TIPS[${#PUBLISH_TIPS[@]}]=$PUBLISH_FEATURE_TIP
+  for ((i = 0; i < ${#PUBLISH_BRANCHES[@]}; i++)); do
+    ref="$STACK_REF/publish/$$/$i"
+    git update-ref "$ref" "${PUBLISH_TIPS[$i]}" || {
+      cleanup_publish_refs
+      rm -f "$index" "$error_file"
+      return 1
+    }
+    PUBLISH_TEMP_REFS[${#PUBLISH_TEMP_REFS[@]}]=$ref
+  done
+  rm -f "$index" "$error_file"
+}
+
+cleanup_publish_refs() {
+  local i
+  for ((i = 0; i < ${#PUBLISH_TEMP_REFS[@]}; i++)); do
+    git update-ref -d "${PUBLISH_TEMP_REFS[$i]}" || true
+  done
+}
+
+publish_ref_transaction() {
+  local action=$1 i
+  {
+    printf 'start\n'
+    for ((i = 0; i < ${#PUBLISH_REF_NAMES[@]}; i++)); do
+      if [ "$action" = apply ]; then
+        printf 'update %s %s %s\n' "${PUBLISH_REF_NAMES[$i]}" \
+          "${PUBLISH_REF_NEW[$i]}" "${PUBLISH_REF_OLD[$i]}"
+      else
+        printf 'update %s %s %s\n' "${PUBLISH_REF_NAMES[$i]}" \
+          "${PUBLISH_REF_OLD[$i]}" "${PUBLISH_REF_NEW[$i]}"
+      fi
+    done
+    printf 'prepare\ncommit\n'
+  } | git update-ref --stdin >/dev/null
+}
+
+snapshot_publish_state() {
+  local i name
+
+  PUBLISH_COMMON_DIR=$(git rev-parse --git-common-dir) ||
+    return 1
+  PUBLISH_COMMON_DIR=$(cd "$PUBLISH_COMMON_DIR" && pwd) ||
+    return 1
+  PUBLISH_SNAPSHOT_DIR="$PUBLISH_COMMON_DIR/git-patch-publish.$$"
+  mkdir "$PUBLISH_SNAPSHOT_DIR" ||
+    return 1
+  PUBLISH_CONFIG="$PUBLISH_COMMON_DIR/config"
+  PUBLISH_GH_NAMES=(gh-stack gh-stack.lock gh-stack-operation.lock)
+  PUBLISH_GH_HAD=()
+  cp -p "$PUBLISH_CONFIG" "$PUBLISH_SNAPSHOT_DIR/config" ||
+    {
+      rm -rf "$PUBLISH_SNAPSHOT_DIR"
+      return 1
+    }
+  for ((i = 0; i < ${#PUBLISH_GH_NAMES[@]}; i++)); do
+    name=${PUBLISH_GH_NAMES[$i]}
+    if [ -e "$PUBLISH_COMMON_DIR/$name" ]; then
+      PUBLISH_GH_HAD[$i]=1
+      cp -p "$PUBLISH_COMMON_DIR/$name" "$PUBLISH_SNAPSHOT_DIR/$name" || {
+        rm -rf "$PUBLISH_SNAPSHOT_DIR"
+        return 1
+      }
+    else
+      PUBLISH_GH_HAD[$i]=0
+    fi
+  done
+}
+
+rollback_publish_state() {
+  local failed=0 i name
+
+  if [ "$PUBLISH_REFS_APPLIED" -eq 1 ] &&
+    ! publish_ref_transaction rollback; then
+    failed=1
+  fi
+  cp -p "$PUBLISH_SNAPSHOT_DIR/config" "$PUBLISH_CONFIG" || failed=1
+  for ((i = 0; i < ${#PUBLISH_GH_NAMES[@]}; i++)); do
+    name=${PUBLISH_GH_NAMES[$i]}
+    if [ "${PUBLISH_GH_HAD[$i]}" -eq 1 ]; then
+      cp -p "$PUBLISH_SNAPSHOT_DIR/$name" \
+        "$PUBLISH_COMMON_DIR/$name" || failed=1
+    else
+      rm -f "$PUBLISH_COMMON_DIR/$name" || failed=1
+    fi
+  done
+  PUBLISH_REFS_APPLIED=0
+  [ "$failed" -eq 0 ] || {
+    printf 'Kunne ikke rulle tilbake hele publiseringstilstanden automatisk.\n' \
+      >&2
+    return 1
+  }
+}
+
+cleanup_publish_state() {
+  cleanup_publish_refs
+  rm -rf "$PUBLISH_SNAPSHOT_DIR"
+}
+
+abort_publish() {
+  local message=$1
+  if rollback_publish_state; then
+    cleanup_publish_state
+    die "$message; lokal publiseringstilstand ble rullet tilbake"
+  fi
+  cleanup_publish_state
+  die "$message; tilbakeringen var ufullstendig"
+}
+
 command_publish_stacked() {
   [ "$#" -eq 0 ] || die "bruk: git patch publish-stacked"
-  local id source branch base_ref existing_stack
+  local id source branch base_ref existing_stack ref old_tip i name
   local -a branches=()
 
-  stack_context
+  stack_setup
   load_stack
   [ -n "$STACK_PATCHES" ] ||
     die "ingen aktive patcher å publisere"
@@ -1216,6 +1400,9 @@ command_publish_stacked() {
       die "stack-metadata mangler source-branch for patchen '$id'"
     git show-ref --verify --quiet "refs/heads/$source" ||
       die "fant ikke den lokale source-branchen '$source'"
+    [ "$(git rev-parse "refs/heads/$source^{commit}")" = \
+      "$(source_tip_for_id "$id")" ] ||
+      die "source-branchen '$source' har endringer; kjør 'git patch sync $source' først"
     branches[${#branches[@]}]=$source
   done
   branches[${#branches[@]}]=$CURRENT_BRANCH
@@ -1233,16 +1420,92 @@ command_publish_stacked() {
   gh repo view --json nameWithOwner >/dev/null 2>&1 ||
     die "fant ingen GitHub-repositorykonfigurasjon for dette repoet"
 
+  build_publish_stack ||
+    die "kunne ikke bygge en lineær publiserings-stack"
+  [ "$(git rev-parse "$PUBLISH_FEATURE_TIP^{tree}")" = \
+    "$(git rev-parse "HEAD^{tree}")" ] || {
+    cleanup_publish_refs
+    die "publiseringshistorikken ville endret feature-innholdet; avbrøt"
+  }
+  [ -z "$(printf '%s\n' "${PUBLISH_BRANCHES[@]}" |
+    sort | uniq -d)" ] || {
+    cleanup_publish_refs
+    die "feature- og patch-branches må ha unike navn"
+  }
+
+  PUBLISH_REF_NAMES=()
+  PUBLISH_REF_OLD=()
+  PUBLISH_REF_NEW=()
+  PUBLISH_REFS_APPLIED=0
+  for ((i = 0; i < ${#PUBLISH_BRANCHES[@]}; i++)); do
+    name=${PUBLISH_BRANCHES[$i]}
+    ref="refs/heads/$name"
+    old_tip=$(git rev-parse "$ref^{commit}") ||
+      die "fant ikke branchen '$name'"
+    PUBLISH_REF_NAMES[${#PUBLISH_REF_NAMES[@]}]=$ref
+    PUBLISH_REF_OLD[${#PUBLISH_REF_OLD[@]}]=$old_tip
+    PUBLISH_REF_NEW[${#PUBLISH_REF_NEW[@]}]=${PUBLISH_TIPS[$i]}
+  done
+  i=0
+  for id in $(stack_patch_ids); do
+    for name in base source; do
+      ref="$STACK_REF/patch/$id/$name"
+      old_tip=$(git rev-parse "$ref^{commit}") ||
+        die "stack-metadata for patchen '$id' er ufullstendig"
+      PUBLISH_REF_NAMES[${#PUBLISH_REF_NAMES[@]}]=$ref
+      PUBLISH_REF_OLD[${#PUBLISH_REF_OLD[@]}]=$old_tip
+      if [ "$name" = base ]; then
+        PUBLISH_REF_NEW[${#PUBLISH_REF_NEW[@]}]=${PUBLISH_BASES[$i]}
+      else
+        PUBLISH_REF_NEW[${#PUBLISH_REF_NEW[@]}]=${PUBLISH_TIPS[$i]}
+      fi
+    done
+    i=$((i + 1))
+  done
+  for ref in "$STACK_REF/feature-start" "$STACK_REF/head"; do
+    old_tip=$(git rev-parse "$ref^{commit}") ||
+      die "stack-metadata er ufullstendig"
+    PUBLISH_REF_NAMES[${#PUBLISH_REF_NAMES[@]}]=$ref
+    PUBLISH_REF_OLD[${#PUBLISH_REF_OLD[@]}]=$old_tip
+    if [ "$ref" = "$STACK_REF/feature-start" ]; then
+      PUBLISH_REF_NEW[${#PUBLISH_REF_NEW[@]}]=$PUBLISH_FEATURE_START
+    else
+      PUBLISH_REF_NEW[${#PUBLISH_REF_NEW[@]}]=$PUBLISH_FEATURE_TIP
+    fi
+  done
+
+  snapshot_publish_state || {
+    cleanup_publish_refs
+    die "kunne ikke ta snapshot av lokal publiseringstilstand"
+  }
+  if ! publish_ref_transaction apply; then
+    cleanup_publish_state
+    die "publiserings-branches ble endret samtidig; ingen endringer ble gjort"
+  fi
+  PUBLISH_REFS_APPLIED=1
+  i=0
+  for id in $(stack_patch_ids); do
+    if ! git config --local \
+      "$(patch_meta_key "$id" source-tip)" "${PUBLISH_TIPS[$i]}"; then
+      abort_publish "kunne ikke oppdatere stack-metadata"
+    fi
+    i=$((i + 1))
+  done
+
   existing_stack=$(gh stack view --json 2>/dev/null || true)
   if [ -n "$existing_stack" ]; then
-    gh stack unstack --local ||
-      die "kunne ikke oppdatere eksisterende lokal gh-stack-konfigurasjon"
+    if ! gh stack unstack --local; then
+      abort_publish "kunne ikke oppdatere eksisterende lokal gh-stack-konfigurasjon"
+    fi
   fi
-  gh stack init --base "$branch" "${branches[@]}" ||
-    die "gh stack init feilet; ingen lokal stackhistorikk ble omskrevet av git-patch"
-  gh stack submit --auto ||
-    die "gh stack submit feilet"
+  if ! gh stack init --base "$branch" "${branches[@]}"; then
+    abort_publish "gh stack init feilet"
+  fi
+  if ! gh stack submit --auto; then
+    abort_publish "gh stack submit feilet"
+  fi
 
+  cleanup_publish_state
   printf 'Publiserte patch-stacken med gh stack.\n'
 }
 

@@ -274,6 +274,14 @@ samlet i feature-laget øverst i stacken. Eksisterende branch-navn beholdes, og 
 Publisering oppretter eller oppdaterer hver branch i riktig base-rekkefølge.
 Nye PR-er opprettes som drafts. Senere endringer bruker `--force-with-lease` og
 oppdaterer avhengige branches, slik at hvert PR-lag viser bare sin egen diff.
+Patch- og feature-branchene bygges først som en ny lineær historie. Branch-navn
+beholdes, og feature-treet må være identisk med arbeidsbranchen før den lokale
+publiseringshistorikken erstatter eksisterende refs. En patch-source som har
+endret seg siden `add` eller `sync` må synkroniseres før publisering.
+
+Brancher, stack-metadata og lokal `gh stack`-sporing oppdateres som én
+publiseringstransaksjon. Ved feil i `init` eller `submit` gjenopprettes de
+opprinnelige refsene og den eksakte tidligere lokale `gh stack`-tilstanden.
 
 ## Under panseret
 
