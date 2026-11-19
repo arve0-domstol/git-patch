@@ -795,6 +795,7 @@ list_patch_conflicts() {
       rm -rf "$simulation_objects"
       return
     fi
+    LIST_CONFLICTS[$i]=none
     parent=$APPLIED_TREE
   done
 
@@ -897,7 +898,7 @@ command_list() {
       LIST_CONFLICTS[${#LIST_CONFLICTS[@]}]=$conflict_reason
       can_replay=0
     else
-      LIST_CONFLICTS[${#LIST_CONFLICTS[@]}]=none
+      LIST_CONFLICTS[${#LIST_CONFLICTS[@]}]=unknown
     fi
   done
 
