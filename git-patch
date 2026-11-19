@@ -446,7 +446,8 @@ restore_sync_stash() {
   local keep=$1
   [ -n "$SYNC_STASH_OID" ] || return 0
   if git stash apply --index -q "$SYNC_STASH_OID"; then
-    if [ "$keep" -eq 0 ]; then
+    if [ "$keep" -eq 0 ] &&
+      [ "$(git rev-parse --verify -q refs/stash || true)" = "$SYNC_STASH_OID" ]; then
       git stash drop -q "stash@{0}"
     fi
     return 0
@@ -455,13 +456,20 @@ restore_sync_stash() {
   return 1
 }
 
+log_sync_rollback() {
+  git config --local --add "$STACK_PREFIX.operations.value" \
+    "rolled back sync after conflicts"
+}
+
 sync_conflict_failure() {
   local patch=$1
   print_conflicts "synkronisere" "$patch"
   printf 'Ingen endringer ble gjort i feature-branchen.\n' >&2
   if [ -n "$SYNC_STASH_OID" ]; then
-    restore_sync_stash 0 || true
+    restore_sync_stash 0 || return 1
   fi
+  log_sync_rollback ||
+    printf 'Kunne ikke lagre rollback-operasjonen i stack-loggen.\n' >&2
   return 1
 }
 
@@ -476,11 +484,21 @@ finish_sync_branch() {
   fi
   if [ -n "$SYNC_STASH_OID" ] &&
     ! git stash apply --index -q "$SYNC_STASH_OID"; then
-    git reset --hard -q "$original_head"
-    if ! git stash apply --index -q "$SYNC_STASH_OID"; then
+    if ! git reset --hard -q "$original_head" ||
+      ! git clean -fdq ||
+      ! git stash apply --index -q "$SYNC_STASH_OID"; then
       printf 'Dine ucommittede endringer ligger i stash@{0}.\n' >&2
+      return 1
+    fi
+    if [ "$(git rev-parse --verify -q refs/stash || true)" = "$SYNC_STASH_OID" ]; then
+      git stash drop -q "stash@{0}" || {
+        printf 'Dine ucommittede endringer ligger i stash@{0}.\n' >&2
+        return 1
+      }
     fi
     printf 'Ingen endringer ble gjort i feature-branchen.\n' >&2
+    log_sync_rollback ||
+      printf 'Kunne ikke lagre rollback-operasjonen i stack-loggen.\n' >&2
     return 1
   fi
   [ -z "$SYNC_STASH_OID" ] || git stash drop -q "stash@{0}"
