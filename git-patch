@@ -718,7 +718,12 @@ command_sync_all() {
     fi
     BUILD_IDS[${#BUILD_IDS[@]}]=$id
     BUILD_NAMES[${#BUILD_NAMES[@]}]=$patch
-    BUILD_BASES[${#BUILD_BASES[@]}]=$SOURCE_BASE
+    if [ "$active_tip" != "$source_tip" ] &&
+      [ "$active_delivered" -eq 1 ]; then
+      BUILD_BASES[${#BUILD_BASES[@]}]=$active_tip
+    else
+      BUILD_BASES[${#BUILD_BASES[@]}]=$SOURCE_BASE
+    fi
     BUILD_TIPS[${#BUILD_TIPS[@]}]=$source_tip
     RETAINED_IDS[${#RETAINED_IDS[@]}]=$id
   done
