@@ -570,6 +570,25 @@ patch_may_be_delivered() {
   return 1
 }
 
+patch_can_apply() {
+  local old_base=$1 source_tip=$2 new_main=$3 index
+
+  index="$GIT_DIR/git-patch-delivery-check.$$"
+  rm -f "$index"
+  GIT_INDEX_FILE=$index git read-tree "$new_main" || {
+    rm -f "$index"
+    return 1
+  }
+  if git diff --binary --full-index "$old_base" "$source_tip" |
+    GIT_INDEX_FILE=$index git apply --cached --check \
+      --whitespace=nowarn - >/dev/null 2>&1; then
+    rm -f "$index"
+    return 0
+  fi
+  rm -f "$index"
+  return 1
+}
+
 confirm_uncertain_delivery() {
   local patch=$1 answer
 
@@ -626,7 +645,7 @@ save_full_sync_metadata() {
 
 command_sync_all() {
   local id patch active_base active_tip source_tip original_head new_main
-  local delivered uncertain
+  local active_delivered current_delivered delivered uncertain
 
   stack_setup
   load_stack
@@ -652,10 +671,19 @@ command_sync_all() {
     source_tip=$SOURCE_TIP
     warn_remote_newer "$patch"
 
+    active_delivered=0
+    if patch_is_delivered "$active_base" "$active_tip" "$new_main"; then
+      active_delivered=1
+    fi
+    current_delivered=0
+    if patch_is_delivered "$SOURCE_BASE" "$source_tip" "$new_main"; then
+      current_delivered=1
+    fi
     delivered=0
-    if patch_is_delivered "$active_base" "$active_tip" "$new_main" ||
+    if [ "$current_delivered" -eq 1 ] ||
       { [ "$active_tip" != "$source_tip" ] &&
-        patch_is_delivered "$SOURCE_BASE" "$source_tip" "$new_main"; }; then
+        [ "$active_delivered" -eq 1 ] &&
+        patch_is_delivered "$active_tip" "$source_tip" "$new_main"; }; then
       delivered=1
     fi
     if [ "$delivered" -eq 1 ]; then
@@ -665,9 +693,12 @@ command_sync_all() {
     fi
 
     uncertain=0
-    if patch_may_be_delivered "$active_base" "$active_tip" "$new_main" ||
-      { [ "$active_tip" != "$source_tip" ] &&
-        patch_may_be_delivered "$SOURCE_BASE" "$source_tip" "$new_main"; }; then
+    if [ "$active_tip" != "$source_tip" ] &&
+      [ "$active_delivered" -eq 1 ]; then
+      if ! patch_can_apply "$active_tip" "$source_tip" "$new_main"; then
+        uncertain=1
+      fi
+    elif patch_may_be_delivered "$SOURCE_BASE" "$source_tip" "$new_main"; then
       uncertain=1
     fi
     if [ "$uncertain" -eq 1 ]; then
