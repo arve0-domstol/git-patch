@@ -749,6 +749,146 @@ command_sync() {
   esac
 }
 
+prepare_drop_build() {
+  local requested_id=$1 id
+
+  BUILD_BASE=$STACK_BASE
+  BUILD_IDS=()
+  BUILD_NAMES=()
+  BUILD_BASES=()
+  BUILD_TIPS=()
+  DROPPED_IDS=()
+  DROPPED_NAMES=()
+
+  for id in $(stack_patch_ids); do
+    if [ -z "$requested_id" ] || [ "$id" = "$requested_id" ]; then
+      DROPPED_IDS[${#DROPPED_IDS[@]}]=$id
+      DROPPED_NAMES[${#DROPPED_NAMES[@]}]=$(patch_name_for_id "$id")
+      continue
+    fi
+    BUILD_IDS[${#BUILD_IDS[@]}]=$id
+    BUILD_NAMES[${#BUILD_NAMES[@]}]=$(patch_name_for_id "$id")
+    BUILD_BASES[${#BUILD_BASES[@]}]=$(base_tip_for_id "$id")
+    BUILD_TIPS[${#BUILD_TIPS[@]}]=$(source_tip_for_id "$id")
+  done
+}
+
+stash_drop_work() {
+  DROP_STASH_OID=
+  if has_worktree_changes; then
+    git stash push -u -q -m "git-patch: pending drop" ||
+      die "kunne ikke stash'e ucommittede endringer"
+    DROP_STASH_OID=$(git rev-parse refs/stash)
+  fi
+}
+
+restore_drop_stash() {
+  local keep=$1
+  [ -n "$DROP_STASH_OID" ] || return 0
+  if git stash apply --index -q "$DROP_STASH_OID"; then
+    if [ "$keep" -eq 0 ]; then
+      git stash drop -q "stash@{0}"
+    fi
+    return 0
+  fi
+  printf 'Dine ucommittede endringer ligger i stash@{0}.\n' >&2
+  return 1
+}
+
+drop_conflict_failure() {
+  local patch=$1
+  print_conflicts "fjerne" "$patch"
+  printf 'Ingen endringer ble gjort i feature-branchen.\n' >&2
+  if [ -n "$DROP_STASH_OID" ]; then
+    restore_drop_stash 0 || true
+  fi
+  return 1
+}
+
+finish_drop_branch() {
+  local original_head=$1 candidate_tip=$2
+
+  if ! git reset --hard -q "$candidate_tip"; then
+    git reset --hard -q "$original_head"
+    restore_drop_stash 0 || true
+    die "kunne ikke oppdatere feature-branchen"
+  fi
+  if [ -n "$DROP_STASH_OID" ] &&
+    ! git stash apply --index -q "$DROP_STASH_OID"; then
+    git reset --hard -q "$original_head"
+    restore_drop_stash 1 || true
+    printf 'Ingen endringer ble gjort i feature-branchen.\n' >&2
+    return 1
+  fi
+}
+
+save_drop_metadata() {
+  local id patch i=0
+
+  git config --local "$(git_config_key base)" "$BUILD_BASE" || return 1
+  for id in "${DROPPED_IDS[@]}"; do
+    remove_patch_metadata "$id" || return 1
+    patch=${DROPPED_NAMES[$i]}
+    git config --local --add "$STACK_PREFIX.operations.value" \
+      "dropped $patch" || return 1
+    i=$((i + 1))
+  done
+  printf 'update %s %s\nupdate %s %s\nupdate %s %s\n' \
+    "$STACK_REF/base" "$BUILD_BASE" \
+    "$STACK_REF/feature-start" "$BUILT_PATCH_TIP" \
+    "$STACK_REF/head" "$BUILT_TIP" |
+    git update-ref --stdin || return 1
+}
+
+command_drop() {
+  [ "$#" -le 1 ] || die "bruk: git patch drop [patch]"
+  local requested=${1-}
+  local requested_id= original_head candidate_tip new_main patch
+
+  stack_setup
+  load_stack
+  [ -n "$STACK_PATCHES" ] || {
+    if [ -n "$requested" ]; then
+      die "patchen '$requested' er ikke lagt til"
+    fi
+    die "ingen aktive patcher å fjerne"
+  }
+  if [ -n "$requested" ]; then
+    requested_id=$(patch_id "$requested")
+    stack_patch_ids | grep -q "^$requested_id$" ||
+      die "patchen '$requested' er ikke lagt til"
+  fi
+
+  git fetch -q origin || die "kunne ikke hente fra origin"
+  new_main=$(git rev-parse "origin/HEAD^{commit}") ||
+    die "fant ikke origin/HEAD"
+  STACK_BASE=$new_main
+  prepare_drop_build "$requested_id"
+
+  original_head=$(git rev-parse HEAD)
+  stash_drop_work
+  if ! build_stack_from_state; then
+    drop_conflict_failure "${requested:-stacken}"
+    return 1
+  fi
+  candidate_tip=$BUILT_TIP
+  if ! finish_drop_branch "$original_head" "$candidate_tip"; then
+    return 1
+  fi
+  save_drop_metadata || {
+    git reset --hard -q "$original_head"
+    if [ -n "$DROP_STASH_OID" ]; then
+      restore_drop_stash 1 || true
+    fi
+    die "kunne ikke lagre oppdatert stack-metadata"
+  }
+  [ -z "$DROP_STASH_OID" ] || git stash drop -q "stash@{0}"
+
+  for patch in "${DROPPED_NAMES[@]}"; do
+    printf 'Fjernet patchen %s fra stacken.\n' "$patch"
+  done
+}
+
 list_patch_delivery() {
   local active_base=$1 active_tip=$2 main_tip
 
@@ -953,7 +1093,11 @@ case ${1-} in
     shift
     command_list "$@"
     ;;
-  drop|publish-stacked)
+  drop)
+    shift
+    command_drop "$@"
+    ;;
+  publish-stacked)
     printf '%s: %s is not implemented yet\n' "$program" "$1" >&2
     exit 125
     ;;
