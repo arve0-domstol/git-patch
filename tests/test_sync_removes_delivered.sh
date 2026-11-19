@@ -34,6 +34,9 @@ git push -q origin main
 git switch -q feature
 git patch sync
 
+if git patch list | grep -q cache; then
+  fail "delivered cache remained in list output"
+fi
 if git config --local --get \
   "git-patch.$stack_id.patches.value" >/dev/null 2>&1; then
   fail "delivered cache remained in stack metadata"
