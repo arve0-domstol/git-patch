@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+
+set -u
+
+program=${0##*/}
+
+usage() {
+  cat <<'EOF'
+Usage: git patch <command> [arguments]
+
+Commands:
+  add <patch>            Add a patch to the current stack
+  list                   List patches in the current stack
+  sync [patch]           Synchronize one or all patches
+  check-conflicts <patch>
+                         Check whether a patch can be applied
+  drop [patch]           Drop one or all patches
+  log                    Show local stack history
+  publish-stacked        Publish the stack as stacked pull requests
+
+Run 'git patch --help' to show this help.
+EOF
+}
+
+case ${1-} in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+  add|list|sync|check-conflicts|drop|log|publish-stacked)
+    printf '%s: %s is not implemented yet\n' "$program" "$1" >&2
+    exit 125
+    ;;
+  "")
+    usage >&2
+    exit 2
+    ;;
+  *)
+    printf '%s: unknown command: %s\n' "$program" "$1" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

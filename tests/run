@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+
+set -u
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+export PATH="$ROOT:$PATH"
+
+passed=0
+failed=0
+
+for test_file in $(find "$ROOT/tests" -type f -name 'test_*.sh' | sort); do
+  name=${test_file#"$ROOT/tests/"}
+  output=$(mktemp)
+  case_tmp=$(mktemp -d)
+  if TEST_TMP="$case_tmp" "$BASH" "$test_file" >"$output" 2>&1; then
+    printf '✅ - %s\n' "$name"
+    ((passed += 1))
+  else
+    printf '❌ - %s\n' "$name"
+    sed 's/^/  /' "$output"
+    ((failed += 1))
+  fi
+  rm -f "$output"
+  rm -rf "$case_tmp"
+done
+
+printf '\n%d passed, %d failed\n' "$passed" "$failed"
+((failed == 0))
