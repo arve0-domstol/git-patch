@@ -1162,9 +1162,21 @@ command_list() {
 }
 
 command_log() {
-  stack_setup
-  git config --local --get-all "$STACK_PREFIX.operations.value" 2>/dev/null ||
+  [ "$#" -eq 0 ] || die "bruk: git patch log"
+  local entry operation found=0
+  local pattern
+
+  stack_context
+  pattern="^git-patch\\.${STACK_ID}\\.operations(\\.value)?$"
+  while IFS= read -r -d '' entry; do
+    operation=${entry#*$'\n'}
+    printf '%s\n' "$operation"
+    found=1
+  done < <(git config --local --null --get-regexp "$pattern" 2>/dev/null)
+
+  if [ "$found" -eq 0 ]; then
     printf 'Ingen stack-historikk ennå.\n'
+  fi
 }
 
 case ${1-} in
